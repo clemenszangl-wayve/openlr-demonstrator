@@ -30,6 +30,7 @@ class RoutePoint:
     lat: float
     lon: float
     frc: int | None = None  # None: any road
+    heading: float | None = None  # direction of travel; picks the carriageway (Valhalla only)
 
 
 @dataclass

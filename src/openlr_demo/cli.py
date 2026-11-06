@@ -1,4 +1,4 @@
-"""Command line interface: ``openlr-demo [run|sweep|serve|scenarios|fetch-data]``."""
+"""Command line interface: ``openlr-demo [run|sweep|serve|crossmap|scenarios|fetch-data]``."""
 
 from __future__ import annotations
 
@@ -77,12 +77,35 @@ def cmd_sweep(args) -> None:
     print(f"done in {time.perf_counter() - t0:.0f} s -> {csv}, {png}")
 
 
+def _valhalla():
+    from .valhalla import ValhallaClient
+
+    client = ValhallaClient.from_env()
+    print(f"Valhalla: {client.url} (responses cached in {client.cache_dir})" if client else "Valhalla: off")
+    return client
+
+
 def cmd_serve(args) -> None:
     from . import webapp
 
     receiver = _load_network(args.data)
     mapbox = _mapbox(not args.no_mapbox, None)
-    webapp.serve(webapp.App(receiver, mapbox), args.host, args.port, open_browser=not args.no_browser)
+    app = webapp.App(receiver, mapbox, _valhalla())
+    webapp.serve(app, args.host, args.port, open_browser=not args.no_browser)
+
+
+def cmd_crossmap(args) -> None:
+    from . import crossmap
+
+    receiver = _load_network(args.data)
+    mapbox = _mapbox(True, None)
+    if mapbox is None:
+        raise SystemExit("crossmap needs Mapbox: set MAPBOX_ACCESS_TOKEN in .env")
+    rows = crossmap.run_scenarios(receiver, mapbox, args.scenario or list(SCENARIOS), args.lrp_distance,
+                                  not args.no_disambiguation)
+    print(crossmap.console(rows))
+    md = crossmap.write_markdown(rows, args.out / "crossmap.md", mapbox.config.profile)
+    print(f"\nReport: {md}  ({mapbox.requests} Mapbox API requests, the rest from the cache)")
 
 
 def cmd_scenarios(_args) -> None:
@@ -128,12 +151,20 @@ def main(argv=None) -> None:
     p_sweep.add_argument("--mapbox-radius", type=float, default=None)
     p_sweep.set_defaults(func=cmd_sweep)
 
-    p_serve = sub.add_parser("serve", parents=[common], help="interactive comparison in the browser")
+    p_serve = sub.add_parser("serve", parents=[common], help="browser app: split view OSM -> OpenLR -> Mapbox")
     p_serve.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     p_serve.add_argument("--port", type=int, default=8765)
     p_serve.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     p_serve.add_argument("--no-mapbox", action="store_true", help="hide the Mapbox comparison")
     p_serve.set_defaults(func=cmd_serve)
+
+    p_cross = sub.add_parser("crossmap", parents=[common],
+                             help="encode the scenarios on OSM, decode them on the Mapbox map, compare")
+    p_cross.add_argument("-s", "--scenario", action="append", choices=list(SCENARIOS), help="scenario key (repeatable)")
+    p_cross.add_argument("--lrp-distance", type=float, nargs="+", default=[15_000.0, 2_000.0],
+                         help="maximum distance between LRPs [m], one run per value (default: 15000 2000)")
+    p_cross.add_argument("--no-disambiguation", action="store_true")
+    p_cross.set_defaults(func=cmd_crossmap)
 
     p_sc = sub.add_parser("scenarios", help="list the test routes")
     p_sc.set_defaults(func=cmd_scenarios)

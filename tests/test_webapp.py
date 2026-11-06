@@ -82,7 +82,7 @@ def post(url, data: bytes):
 
 
 def test_http(server, app):
-    status, body = get(server + "/")
+    status, body = get(server + "/compare")
     assert status == 200 and b"/app.js" in body
     assert get(server + "/app.js")[0] == 200
     assert get(server + "/api/config")[0] == 200

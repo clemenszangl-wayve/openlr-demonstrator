@@ -3,95 +3,102 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenLR vs. map matching on stacked roads</title>
+<title>OpenLR across maps: OSM &rarr; Mapbox</title>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
-<link href="/app.css" rel="stylesheet">
+<link href="/split.css" rel="stylesheet">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-<script src="https://unpkg.com/deck.gl@9.1.14/dist.min.js"></script>
 </head>
 <body>
-<aside id="side">
-  <header>
-    <h1>OpenLR vs. linestring map matching</h1>
-    <p class="hint">Click the map to add route points. Where roads are stacked, pick the road you mean &ndash;
-      its <b>FRC</b> (road class) is stored with the point and decides which level the route takes.</p>
-  </header>
+<header id="bar">
+  <h1>OpenLR across maps</h1>
+  <span class="flow"><b>OSM</b> (Valhalla route) &rarr; <b>OpenLR</b> &rarr; <b>Mapbox</b> (<span id="profile">-</span>)</span>
+  <span class="spacer"></span>
+  <select id="preset" aria-label="Examples"><option value="">Example route&hellip;</option></select>
+  <label class="check"><input type="checkbox" id="sync" checked> sync maps</label>
+  <a href="/compare" class="link" title="OpenLR vs. linestring map matching on a simulated second map">Linestring comparison &rarr;</a>
+</header>
 
-  <section>
-    <select id="preset" aria-label="Examples"><option value="">Load an example route&hellip;</option></select>
-  </section>
-
-  <section>
-    <div class="row">
-      <h2>Route points</h2><span class="spacer"></span>
-      <button id="reverse" class="small" title="Reverse the direction of travel">Reverse</button>
-      <button id="clear" class="small">Clear</button>
+<div id="split">
+  <!-- ============================================================ left: encoder side -->
+  <section class="half" id="left">
+    <div class="map-wrap">
+      <div id="map-left" class="map"></div>
+      <div class="map-title"><b>1 &middot; Encoder map: OpenStreetMap</b><small>click to add route points</small></div>
+      <div class="legend" id="legend-left"></div>
     </div>
-    <textarea id="points" rows="5" spellcheck="false"
-      placeholder="lat, lon, FRC &ndash; one point per line, e.g.&#10;35.65720, 139.70050, FRC1&#10;35.64590, 139.67580, FRC1"></textarea>
-    <div id="points-msg" class="msg"></div>
-    <details class="help">
-      <summary>Format and FRC values</summary>
-      <p>One point per line: <code>lat, lon, FRC</code>. The FRC is optional (nearest road). Pairs in
-        <code>lon,lat</code> order and Mapbox-style <code>lon,lat;lon,lat</code> lists are recognised too.</p>
-      <table id="frc-table"></table>
-    </details>
-  </section>
-
-  <section>
-    <h2>Map A &rarr; OSM difference</h2>
-    <p class="hint">OpenLR is encoded on map A and decoded on OSM; the linestring methods get map A's coordinates.</p>
-    <div class="grid">
-      <label>Offset <output id="shift-v"></output> m<input type="range" id="shift" min="0" max="20" step="0.5"></label>
-      <label>towards <output id="bearing-v"></output>&deg;<input type="range" id="bearing" min="0" max="355" step="5"></label>
-      <label>Warp &plusmn;<output id="warp-v"></output> m<input type="range" id="warp" min="0" max="5" step="0.5"></label>
-      <label>Generalised <output id="simplify-v"></output> m<input type="range" id="simplify" min="0" max="5" step="0.5"></label>
+    <div class="panel">
+      <div class="cols">
+        <div>
+          <div class="row">
+            <h2>Route points</h2><span class="spacer"></span>
+            <button id="reverse" class="small" title="Reverse the direction of travel">Reverse</button>
+            <button id="clear" class="small">Clear</button>
+          </div>
+          <textarea id="points" rows="4" spellcheck="false"
+            placeholder="lat, lon, FRC, heading &ndash; one point per line, e.g.&#10;35.65720, 139.70050, FRC1, 250°&#10;35.64590, 139.67580, FRC1"></textarea>
+          <div id="points-msg" class="msg"></div>
+          <p class="hint">Valhalla routes through the points; the FRC restricts each point to that road class (which
+            picks the level on stacked roads), the optional heading picks the carriageway. The route is then placed on
+            the OSM road network and encoded.</p>
+        </div>
+        <div>
+          <h2>Encoder</h2>
+          <label class="field">Max. distance between LRPs
+            <select id="spacing">
+              <option value="15000">15 km (whitepaper limit)</option>
+              <option value="5000">5 km</option>
+              <option value="2000">2 km</option>
+              <option value="1000">1 km</option>
+              <option value="500">500 m</option>
+            </select>
+          </label>
+          <p class="hint" id="spacing-hint">Mapbox routes by travel time, OpenLR assumes shortest paths. Closer LRPs
+            leave less room for the two to differ.</p>
+          <label class="check"><input type="checkbox" id="disambiguate" checked> extra LRP at ambiguous Y-splits</label>
+          <div class="row actions">
+            <button id="run" class="primary">Route &amp; encode</button>
+            <label class="check"><input type="checkbox" id="auto" checked> automatic</label>
+          </div>
+        </div>
+      </div>
+      <div id="status-left" class="msg"></div>
+      <div id="route-info"></div>
+      <div class="card" id="openlr-card">
+        <div class="row"><h3>OpenLR line location</h3><span class="spacer"></span>
+          <button id="copy" class="small">Copy</button></div>
+        <textarea id="code" rows="2" spellcheck="false" placeholder="Base64 OpenLR code &ndash; encode a route or paste one"></textarea>
+        <div class="row actions"><span id="code-info" class="hint"></span><span class="spacer"></span>
+          <button id="decode" class="primary">Decode on Mapbox &rarr;</button></div>
+        <div id="lrp-table"></div>
+        <details id="encoder-log"><summary>Encoder log</summary><ol></ol></details>
+      </div>
     </div>
   </section>
 
-  <section>
-    <h2>Methods</h2>
-    <div id="methods"></div>
-    <label class="check"><input type="checkbox" id="disambiguate" checked> OpenLR: extra LRP at ambiguous Y-splits</label>
-    <label class="check" id="mapbox-radius-row">Mapbox search radius
-      <input type="number" id="mapbox-radius" min="1" max="50" step="1"> m</label>
+  <!-- ============================================================ right: decoder side -->
+  <section class="half" id="right">
+    <div class="map-wrap">
+      <div id="map-right" class="map"></div>
+      <div class="map-title"><b>2 &middot; Decoder map: Mapbox</b><small id="right-sub">OpenLR decoded with Tilequery + Directions</small></div>
+      <div class="map-tools">
+        <select id="basemap-right" aria-label="Basemap"></select>
+      </div>
+      <div class="legend" id="legend-right"></div>
+    </div>
+    <div class="panel">
+      <div id="status-right" class="msg"></div>
+      <div id="verdict"></div>
+      <div class="cols">
+        <div id="accuracy"></div>
+        <div id="similarity"></div>
+      </div>
+      <div class="card" id="reference-card" hidden></div>
+      <div class="card" id="decoding-card" hidden></div>
+      <p class="hint" id="right-foot"></p>
+    </div>
   </section>
-
-  <div class="row actions">
-    <button id="run" class="primary">Compare</button>
-    <label class="check"><input type="checkbox" id="auto" checked> update automatically</label>
-  </div>
-  <div id="status" class="msg"></div>
-
-  <section id="results" hidden>
-    <h2>Result</h2>
-    <p id="summary" class="hint"></p>
-    <table id="result-table" class="table"></table>
-    <h3>Which level did each method choose?</h3>
-    <div id="profile"></div>
-    <div id="route-info"></div>
-    <div class="card" id="openlr-card"></div>
-    <div class="card" id="mapbox-card" hidden></div>
-  </section>
-
-  <footer class="hint">
-    Ground truth = shortest path through your points on OSM, using roads whose FRC lies between the
-    FRCs of consecutive points. Map data &copy; OpenStreetMap contributors (ODbL).
-  </footer>
-</aside>
-
-<main id="map"></main>
-
-<div id="map-tools">
-  <button id="toggle-3d" title="Show roads at their OSM layer height">3D</button>
-  <select id="basemap" aria-label="Basemap">
-    <option value="gray">Light gray</option>
-    <option value="imagery">Satellite</option>
-    <option value="osm">OpenStreetMap</option>
-  </select>
 </div>
-<div id="legend" hidden></div>
 
-<script src="/app.js"></script>
+<script src="/split.js"></script>
 </body>
 </html>

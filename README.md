@@ -1,4 +1,4 @@
-# OpenLR vs. linestring map matching on stacked roads (Tokyo)
+# OpenLR on stacked roads in Tokyo: across maps, and against linestring map matching
 
 A self-contained Python demonstrator that encodes routes as **OpenLR line locations**
 (following the [OpenLR whitepaper v1.5](https://download.tomtom.com/open/banners/openlr-whitepaper_v1.5.pdf))
@@ -17,8 +17,115 @@ alone cannot tell them apart. OpenLR also transmits road class (FRC), form of wa
 bearing, distances and the lowest road class allowed between the points. These attributes
 let the decoder find the correct level.
 
-A browser app (`openlr-demo serve`) lets you enter your own route as lat/lon points, each
-with the FRC of the road you mean, and compares all methods on it.
+The demonstrator has two parts:
+
+* **Split view, OSM → OpenLR → Mapbox** (`openlr-demo serve`, page `/`). On the left you draw a
+  route on OpenStreetMap; [Valhalla](https://valhalla.github.io/valhalla/) routes it and the
+  demo encodes it as OpenLR. On the right the same OpenLR code is decoded on the Mapbox map
+  (ZENRIN routing profile), and the two routes are compared: accuracy line by line, and
+  geometric and attribute similarity. Encoder and decoder maps are genuinely different here.
+* **Linestring comparison** (page `/compare`, `openlr-demo run`, `sweep`). OpenLR against three
+  linestring matchers on a simulated second map, described from
+  [Result in one table](#result-in-one-table) on.
+
+![Split view: a route drawn on OSM (left), its OpenLR code decoded on Mapbox (right)](docs/img/split_view.png)
+
+## Split view: OSM → OpenLR → Mapbox
+
+**Left: encoder map (OpenStreetMap).**
+
+1. Click the map to add route points, or type them as `lat, lon, FRC, heading` (FRC and
+   heading are optional). On stacked roads, a click lists every road within 40 m: its class
+   (FRC), its level and, for one-way roads, its direction. Pick the road you mean.
+
+   ![Road picker on Shuto 3 / Route 246: same spot, different level and direction](docs/img/split_picker.png)
+
+2. [Valhalla](https://valhalla.github.io/valhalla/) routes through the points. The FRC
+   becomes a `search_filter` on Valhalla's road class, which picks the level. The heading
+   picks the carriageway.
+3. The Valhalla route is placed on the bundled OSM network: an HMM over the densified shape,
+   guided by the OSM way IDs that Valhalla returns. The panel shows how much of the route
+   lies on the same OSM ways (100 % for all examples).
+4. The OSM path is encoded as an OpenLR line location (whitepaper encoder, below). The panel
+   shows the code, the LRP table and the encoder log. The code box is editable, so you can
+   paste any OpenLR line location and decode it.
+
+**Right: decoder map (Mapbox, ZENRIN profile).** The OpenLR code is decoded without OSM
+(see [Decoding on Mapbox](#decoding-on-mapbox-mapbox_decoderpy)). The map shows:
+
+* the original route (blue) and the LRPs as received, with bearing arrows;
+* the Mapbox candidates for each LRP, filled when chosen;
+* the decoded route (magenta, dashed in tunnels);
+* the roads that differ from the original, highlighted in red.
+
+The panel shows a verdict, the metrics, the LRPs as read from the binary code, the candidate
+and route-attempt tables with each check result, and the number of Mapbox API requests.
+The basemap is Mapbox Streets, Satellite or Light. The tiles are fetched through the local
+server, so the token stays there. Both maps move together (`sync maps`).
+
+**Metrics.** *Accuracy*: the Mapbox route is matched back onto OSM (Mapbox returns no OSM
+IDs) and compared line by line with the original OSM path:
+
+* length-weighted precision and recall;
+* the share on the right level;
+* correct, when precision and recall are both at least 95 %.
+
+*Similarity* compares the two geometries directly:
+
+* buffer precision, recall and F1 within 5, 10 and 20 m;
+* mean, median and 95th-percentile deviation;
+* Hausdorff and discrete Fréchet distance (the latter respects the direction of travel);
+* length ratio and start/end offsets;
+* road-class and tunnel agreement: for every 2 m of the original, the nearest decoded piece
+  within 25 m.
+
+Geometry alone cannot separate stacked roads, so the routes count as *similar* only if:
+
+* F1 within 10 m is at least 0.9;
+* the Fréchet distance is at most 30 m;
+* the road classes agree on at least 75 %.
+
+Without an original route (a pasted code), the reference is the same code decoded on OSM.
+
+**Results** (`openlr-demo crossmap` writes `output/crossmap.md`). All six scenarios are
+encoded on OSM and decoded on `andrewwayve.zenrin-premium/driving`. The maximum distance
+between LRPs is either the whitepaper's 15 km or the split view's default of 2 km:
+
+| scenario | 15 km: LRPs | result | P / R | F1 @ 10 m | Fréchet | FRC agr. | 2 km: LRPs | result | P / R | Fréchet |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Shuto 3, elevated | 2 | correct | 1.00 / 1.00 | 1.00 | 3.8 m | 100 % | 3 | correct | 1.00 / 1.00 | 3.3 m |
+| Shuto 3 → Sangenjaya exit | 2 | **wrong** | 0.24 / 0.24 | 0.93 | 12.2 m | 23 % | 3 | correct | 1.00 / 1.00 | 3.9 m |
+| Route 246, below Shuto 3 | 2 | correct | 1.00 / 1.00 | 1.00 | 9.0 m | 100 % | 3 | correct | 1.00 / 1.00 | 7.5 m |
+| C2 Yamate Tunnel | 2 | correct | 1.00 / 1.00 | 0.99 | 11.6 m | 100 % | 3 | correct | 1.00 / 1.00 | 11.0 m |
+| Yamate-dori, above C2 | 2 | correct | 1.00 / 1.00 | 1.00 | 4.6 m | 100 % | 2 | correct | 1.00 / 1.00 | 4.6 m |
+| Route 246 → Ikejiri on-ramp → Shuto 3 | 2 | correct | 1.00 / 1.00 | 0.97 | 12.5 m | 81 % | 3 | correct | 1.00 / 1.00 | 12.5 m |
+
+The 81 % road-class agreement on the ramp route is a classification difference. OSM tags the
+Ikejiri on-ramp `motorway_link` (FRC0), while Mapbox reports it as `trunk_link` (FRC1).
+
+**Fastest vs. shortest path.** The one failure is instructive. The
+code `C2NYcxlbXwE3PfKc+ecKYwMB` has two LRPs 3.6 km apart: *FRC0 MOTORWAY, bearing 266°,
+LFRCNP FRC1* on Shuto 3, and *FRC1* on Route 246 after the Sangenjaya exit. The OpenLR
+encoder guarantees that the location is the **shortest** path between the LRPs on its own
+map. Mapbox Directions returns the **fastest** route under its own cost model. That route
+leaves the viaduct at the Shibuya exit after about 650 m and follows Route 246 below. It has
+practically the same length (3614 m against a DNP of 3604 m), starts on a motorway and uses
+nothing below FRC1, so it passes every check OpenLR defines. Mapbox also returns no alternative route for this
+pair. With LRPs at most 2 km apart, the third LRP sits on the viaduct beyond the Shibuya
+exit, and the route is decoded correctly. That costs 7 more bytes (25 instead of 18; 36
+instead of 24 base64 characters).
+
+![The 15 km code decoded on Mapbox: the route leaves Shuto 3 at the Shibuya exit (red: different roads)](docs/img/split_wrong.png)
+
+**API usage.** Decoding a code with *n* LRPs takes:
+
+* *n* Tilequery requests;
+* *n − 1* Directions requests, plus retries when a candidate pair fails a check (at most 30).
+
+Responses are cached in `output/.cache/mapbox/`, so repeating a route makes no new
+requests. The full `crossmap` run (12 decodes) needs 31 requests the first time. Valhalla's public
+server (FOSSGIS) is used at most once per second, with two requests per route (`/route`,
+`/trace_attributes`), also cached. Set `VALHALLA_URL` to use your own instance.
 
 ![Shuto 3 in 3D: OpenLR (green) stays on the viaduct; nearest-road (red), HMM (purple) and Mapbox (pink) fall onto Route 246](docs/img/shuto3_3d.png)
 
@@ -72,7 +179,8 @@ With [uv](https://docs.astral.sh/uv/) (`brew install uv`):
 
 ```bash
 uv sync
-uv run openlr-demo serve      # browser app on http://localhost:8765/
+uv run openlr-demo serve      # browser app on http://localhost:8765/ (split view; /compare)
+uv run openlr-demo crossmap   # scenarios: OSM -> OpenLR -> Mapbox, output/crossmap.md (needs a token)
 uv run openlr-demo run        # all scenarios: console report, maps, output/report.md
 uv run openlr-demo sweep      # robustness sweep: output/sweep.csv + sweep.png (~45 s)
 uv run pytest
@@ -96,9 +204,11 @@ Without a token, everything runs and Mapbox is simply left out. To include it, c
 MAPBOX_ACCESS_TOKEN=pk....
 MAPBOX_PROFILE=andrewwayve.zenrin-premium/driving   # or mapbox/driving
 MAPBOX_RADIUS=20                                    # search radius per point [m]
+VALHALLA_URL=https://valhalla1.openstreetmap.de     # routing for the split view (default)
 ```
 
-Environment variables of the same name take precedence over `.env`. A profile without a
+The split view needs Mapbox for its right half; without a token, the left half still routes
+and encodes. Environment variables of the same name take precedence over `.env`. A profile without a
 slash gets `/driving` appended. The custom profile URL form is
 `<account>.zenrin-premium/driving`; `<account>/zenrin-premium` returns 404. The token is
 only sent to `api.mapbox.com`. It is never written to reports, maps or the response cache in
@@ -110,9 +220,10 @@ off). `sweep` only does so with `--mapbox`, because that is 540 requests; the AP
 per minute, and the client sends at most 4 per second. Responses are cached, so a repeated
 run makes no requests.
 
-## Browser app
+## Linestring comparison in the browser (`/compare`)
 
-`openlr-demo serve` starts a local web server (bound to 127.0.0.1) and opens the page:
+`openlr-demo serve` starts a local web server (bound to 127.0.0.1) and opens the split view
+described above. The link *Linestring comparison* at the top right opens this page:
 
 ![Browser app with the Shuto 3 example](docs/img/web_ui.png)
 
@@ -166,7 +277,8 @@ The level profile shows that they are not on the same road:
 
 | command | what it does |
 |---|---|
-| `openlr-demo serve` | Browser app on `http://localhost:8765/` (`--port`, `--host`, `--no-browser`, `--no-mapbox`). |
+| `openlr-demo serve` | Browser app on `http://localhost:8765/`: split view at `/`, linestring comparison at `/compare` (`--port`, `--host`, `--no-browser`, `--no-mapbox`). |
+| `openlr-demo crossmap [-s KEY ...]` | Encodes the scenarios on OSM, decodes them on Mapbox and writes `output/crossmap.md` (`--lrp-distance 15000 2000`: one run per maximum LRP distance; `--no-disambiguation`). |
 | `openlr-demo run [-s KEY ...]` | Runs one or all scenarios. Options: `--shift`, `--bearing`, `--warp`, `--wavelength`, `--simplify` and `--seed` set the map difference; `--no-disambiguation` turns off the extra LRPs at Y-splits; `--no-mapbox` and `--mapbox-radius` control Mapbox; `--no-html` prints to the console only. |
 | `openlr-demo sweep` | Success rate against offset (`--shifts 0 5 10`, `--directions 12`; `--mapbox` includes Mapbox, ~3 min the first time). |
 | `openlr-demo scenarios` | Lists the test routes. |
@@ -270,6 +382,37 @@ returned, e.g. `trunk 760 m -> trunk tunnel 26 m -> … -> trunk 1997 m` for the
 route. This makes it easy to check that a wrong result is Mapbox's choice and not an
 artefact of the transfer.
 
+### Decoding on Mapbox (`mapbox_decoder.py`)
+
+The split view decodes OpenLR on a map it can only reach through web APIs. Mapbox has no
+OpenLR decoder and no road graph to download, so the whitepaper decoder (section 12) is
+rebuilt from two APIs:
+
+| decoder step | on Mapbox |
+|---|---|
+| Candidate lines per LRP | [Tilequery](https://docs.mapbox.com/api/maps/tilequery/) on `mapbox.mapbox-streets-v8`, road layer, 50 m radius: the nearest point of every drivable road, with class, structure (bridge/tunnel), one-way flag and distance. |
+| Rating | Mean of three scores: distance (1 at 0 m, 0 at 50 m), FRC (class → FRC as above, minus 0.25 per class of difference) and FOW (derived from class and one-way). The best 4 candidates per LRP are kept. |
+| Shortest path between candidates | One [Directions](https://docs.mapbox.com/api/navigation/directions/) request per LRP pair, from candidate to candidate. It uses the LRP bearing ±40° at the start (reversed bearing at the last LRP), a 4 m snap radius (12 m retry) and `continue_straight`. |
+| Checks | The route must start on the candidate's road class (stacked roads: the snap must not jump levels). Its length must match DNP within 40 m + 10 %. No road more than one class below LFRCNP may be used. |
+| Backtracking | Depth-first over the candidate combinations, best rating first, at most 30 Directions requests. If nothing passes, the best-scoring route is shown and flagged "not checked". |
+| Offsets | Positive and negative offsets are cut from the first and last leg in proportion to their length. |
+
+Unlike the OSM decoder, this one cannot see the road graph, only routes. Directions
+optimises travel time, not distance, which is why closer LRPs help (see
+[Fastest vs. shortest path](#split-view-osm--openlr--mapbox)).
+
+### Valhalla routes on OSM (`valhalla.py`)
+
+`/route` receives the points. The first and last are `break` locations, the rest `through`.
+Each point has a `search_filter` for its FRC's road class and an optional heading (±45°).
+`/trace_attributes` then returns the OSM way ID of every edge (`edge_walk`, falling back to
+`walk_or_snap`). The shape is densified to 10 m and matched onto the bundled OSM network
+with the HMM, with a 25 m penalty for OSM lines whose way ID differs from the Valhalla
+edge's. Valhalla runs on OSM too, so this transfer is exact for all examples. The examples
+menu sends only each scenario's start and end, exactly on its carriageway with the road's
+heading. The scenario anchors in between lie between stacked roads, and Valhalla routes in
+2D: on the Sangenjaya exit ramp, the Shuto 3 main line is 3 m closer than the ramp.
+
 ### Metrics (`evaluation.py`)
 
 * **Precision and recall:** length-weighted overlap of the matched path with the ground
@@ -350,6 +493,13 @@ artefact of the transfer.
 * **The baselines only see geometry.** A linestring matcher that also transmits road
   class, heading and distance would do better, but at that point it is re-inventing
   OpenLR, just without a standard format.
+* **The Mapbox decoder is a reconstruction.** Mapbox has no OpenLR decoder, so the split view
+  builds one from Tilequery and Directions. Its decisions depend on Mapbox's routing cost
+  (travel time, tolls, turn costs), which OpenLR does not model. The Mapbox Streets basemap
+  and the ZENRIN routing graph can also differ in detail.
+* **Valhalla is the public FOSSGIS server by default** ([usage policy](https://valhalla1.openstreetmap.de):
+  fair use, at most one request per second). Its OSM data can be newer than the bundled
+  extract. A route that leaves the extract is rejected with a hint to rebuild it.
 * **Heights in the 3D view** are OSM `layer` × 15 m, purely illustrative.
 * **Only line locations** are implemented, not point or area locations.
 
@@ -363,7 +513,11 @@ src/openlr_demo/
   encoder.py     OpenLR line encoder (whitepaper 11.1)
   decoder.py     MapReader adapter for openlr-dereferencer
   matchers.py    nearest-road and HMM linestring matchers
-  mapbox.py      Mapbox Map Matching client (cached), response parsing, transfer to OSM
+  mapbox.py      Mapbox client (Map Matching, Directions, Tilequery, basemap tiles; cached), transfer to OSM
+  mapbox_decoder.py  OpenLR decoder on the Mapbox map (Tilequery candidates + Directions legs)
+  valhalla.py    Valhalla routing client (cached) and transfer of its routes onto OSM
+  similarity.py  route similarity across maps (buffer F1, Hausdorff, Frechet, FRC/tunnel agreement)
+  crossmap.py    round trip OSM -> OpenLR -> Mapbox and the `crossmap` report
   settings.py    environment / .env settings
   sender_map.py  simulated map differences (map A)
   scenarios.py   the stacked-road routes
@@ -373,13 +527,15 @@ src/openlr_demo/
   sweep.py       robustness sweep
   viz.py         Leaflet 2D map, deck.gl 3D view, matplotlib plots
   report.py      console and Markdown report
-  webapp.py      `openlr-demo serve`: standard-library HTTP server + JSON API
-  static/        browser app (MapLibre + deck.gl)
+  webapp.py      `openlr-demo serve`: standard-library HTTP server, JSON API, Mapbox tile proxy
+  static/        split view (index.html, split.js/css: MapLibre) and linestring comparison
+                 (compare.html, app.js/css: MapLibre + deck.gl)
   osm_fetch.py   PBF download + extraction (pyosmium)
   cli.py         `openlr-demo` command
 tests/           encoder on hand-built networks, end-to-end scenarios, point router, web API,
-                 Mapbox on recorded answers (tests/data, no token needed)
-.env.example     Mapbox settings template (copy to the git-ignored .env)
+                 Mapbox on recorded answers (tests/data, no token needed), split view on
+                 recorded Valhalla + Mapbox responses (tests/data/recorded, offline)
+.env.example     Mapbox and Valhalla settings template (copy to the git-ignored .env)
 docs/img/        screenshots used in this README
 ```
 
@@ -393,5 +549,7 @@ into `data/raw/` (git-ignored, about 90 MB) and rebuilds the extract. After an O
 the scenario anchors in `scenarios.py` may need adjusting.
 
 Basemaps: Esri (Light Gray Canvas, World Imagery), OpenStreetMap and OpenFreeMap, all
-usable without an API key. The recorded Mapbox answers in `tests/data/` are trimmed to
-the fields the parser reads.
+usable without an API key; in the split view's right half, Mapbox (© Mapbox © OpenStreetMap)
+through the local proxy. Routing: Valhalla on the FOSSGIS public server. The recorded Mapbox
+answers in `tests/data/` are trimmed to the fields the parser reads; `tests/data/recorded/`
+holds unmodified Valhalla and Mapbox responses (no token) for the offline split-view tests.

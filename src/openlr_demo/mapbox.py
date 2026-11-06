@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -31,6 +32,10 @@ from .network import FRC_BY_HIGHWAY, Line, RoadNetwork
 from .settings import setting
 
 API_URL = "https://api.mapbox.com/matching/v5"
+DIRECTIONS_URL = "https://api.mapbox.com/directions/v5"
+TILEQUERY_URL = "https://api.mapbox.com/v4"
+TILEQUERY_TILESET = "mapbox.mapbox-streets-v8"
+STYLES_URL = "https://api.mapbox.com/styles/v1"
 DEFAULT_PROFILE = "mapbox/driving"
 DEFAULT_RADIUS_M = 20.0
 MAX_COORDINATES = 100  # API limit per request
@@ -48,7 +53,9 @@ def class_frc(road_class: str | None) -> int | None:
 
 
 class MapboxError(Exception):
-    pass
+    def __init__(self, text: str, status: int | None = None, code: str | None = None, message: str = ""):
+        super().__init__(text)
+        self.status, self.code, self.message = status, code, message or text
 
 
 @dataclass(frozen=True)
@@ -115,58 +122,133 @@ class MapboxMatch:
 
 # ---------------------------------------------------------------------- API client
 class MapboxClient:
-    """Map Matching requests with an on-disk cache (responses only - never the token)."""
+    """Map Matching, Directions and Tilequery requests with an on-disk cache (responses only -
+    never the token). With ``offline=True`` only cached responses are used (tests)."""
 
     min_interval_s = 0.25  # stay well below the API rate limit of 300 requests / minute
+    TILE_STYLES = {"streets": "mapbox/streets-v12", "satellite": "mapbox/satellite-streets-v12",
+                   "light": "mapbox/light-v11"}
 
-    def __init__(self, config: MapboxConfig):
+    def __init__(self, config: MapboxConfig, offline: bool = False):
         self.config = config
+        self.offline = offline
+        self.requests = 0  # API requests actually sent (not served from the cache)
+        self.tile_requests = 0  # basemap tiles fetched for the browser
         self._lock = threading.Lock()
+        self._tile_lock = threading.Lock()
         self._last = 0.0
+        self._tiles: OrderedDict[tuple, bytes] = OrderedDict()
 
+    # ------------------------------------------------------------------ Map Matching
     def request(self, coords: list[LonLat]) -> tuple[dict, bool]:
         params = {
             "geometries": "geojson", "overview": "full", "steps": "true", "tidy": "false",
             "radiuses": ";".join(f"{self.config.radius_m:g}" for _ in coords),
         }
         path = ";".join(f"{lon:.6f},{lat:.6f}" for lon, lat in coords)
-        key = hashlib.sha256(json.dumps([self.config.profile, path, params]).encode()).hexdigest()[:32]
-        cache = self.config.cache_dir / f"{key}.json" if self.config.cache_dir else None
+        key = [self.config.profile, path, params]
+        return self._cached(key, f"{API_URL}/{self.config.profile}/{path}.json", params, ("Ok", "NoMatch"))
+
+    # ------------------------------------------------------------------ Directions
+    def directions(self, coords: list[LonLat], bearings: list[tuple[float, float] | None],
+                   radiuses: list[float]) -> tuple[dict, bool]:
+        params = {
+            "geometries": "geojson", "overview": "full", "steps": "true", "alternatives": "false",
+            "continue_straight": "true",
+            "bearings": ";".join("" if b is None else f"{round(b[0]) % 360},{round(b[1])}" for b in bearings),
+            "radiuses": ";".join(f"{r:g}" for r in radiuses),
+        }
+        path = ";".join(f"{lon:.6f},{lat:.6f}" for lon, lat in coords)
+        key = ["directions", self.config.profile, path, params]
+        return self._cached(key, f"{DIRECTIONS_URL}/{self.config.profile}/{path}.json", params,
+                            ("Ok", "NoRoute", "NoSegment"))
+
+    # ------------------------------------------------------------------ Tilequery
+    def tilequery(self, lon: float, lat: float, radius: float) -> tuple[dict, bool]:
+        params = {"radius": f"{radius:g}", "limit": "50", "layers": "road", "dedupe": "true"}
+        path = f"{lon:.6f},{lat:.6f}"
+        key = ["tilequery", TILEQUERY_TILESET, path, params]
+        return self._cached(key, f"{TILEQUERY_URL}/{TILEQUERY_TILESET}/tilequery/{path}.json", params,
+                            ("FeatureCollection",), code_key="type")
+
+    # ------------------------------------------------------------------ raster basemap (proxied)
+    def tile(self, style: str, z: int, x: int, y: int) -> bytes:
+        """256 px raster tile (@2x) of a Mapbox style; kept in memory only."""
+        if style not in self.TILE_STYLES or not (0 <= z <= 22 and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+            raise MapboxError("invalid tile")
+        key = (style, z, x, y)
+        with self._tile_lock:
+            if key in self._tiles:
+                self._tiles.move_to_end(key)
+                return self._tiles[key]
+        if self.offline:
+            raise MapboxError("offline")
+        query = urllib.parse.urlencode({"access_token": self.config.token})
+        url = f"{STYLES_URL}/{self.TILE_STYLES[style]}/tiles/256/{z}/{x}/{y}@2x?{query}"
+        data = self._fetch(url, throttle=False)
+        with self._tile_lock:
+            self._tiles[key] = data
+            while len(self._tiles) > 3000:
+                self._tiles.popitem(last=False)
+        return data
+
+    # ------------------------------------------------------------------ plumbing
+    def _cached(self, key: list, url: str, params: dict, cache_codes: tuple[str, ...],
+                code_key: str = "code") -> tuple[dict, bool]:
+        digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:32]
+        cache = self.config.cache_dir / f"{digest}.json" if self.config.cache_dir else None
         if cache and cache.exists():
             return json.loads(cache.read_text(encoding="utf-8")), True
+        if self.offline:
+            raise MapboxError("offline and not cached")
         query = urllib.parse.urlencode({**params, "access_token": self.config.token})
-        url = f"{API_URL}/{self.config.profile}/{path}.json?{query}"
-        data = self._get(url)
-        if cache and data.get("code") in ("Ok", "NoMatch"):
+        data = self._get(f"{url}?{query}")
+        if cache and data.get(code_key) in cache_codes:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(data), encoding="utf-8")
         return data, False
 
     def _get(self, url: str) -> dict:
+        try:
+            return json.loads(self._fetch(url))
+        except MapboxError as exc:
+            if exc.status == 422:  # e.g. NoSegment / InvalidInput: a valid "no match" answer
+                return {"code": exc.code or "InvalidInput", "message": exc.message}
+            raise
+
+    def _fetch(self, url: str, throttle: bool = True) -> bytes:
         for attempt in range(4):
-            with self._lock:
-                wait = self._last + self.min_interval_s - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
-                self._last = time.monotonic()
+            if throttle:
+                with self._lock:
+                    wait = self._last + self.min_interval_s - time.monotonic()
+                    if wait > 0:
+                        time.sleep(wait)
+                    self._last = time.monotonic()
             try:
                 with urllib.request.urlopen(url, timeout=30) as resp:
-                    return json.load(resp)
+                    data = resp.read()
+                with self._tile_lock:
+                    if throttle:
+                        self.requests += 1
+                    else:
+                        self.tile_requests += 1
+                return data
             except urllib.error.HTTPError as exc:  # never include the URL: it contains the token
                 body = exc.read().decode("utf-8", "replace")
                 try:
-                    message = json.loads(body).get("message", body)
+                    payload = json.loads(body)
+                    message, code = payload.get("message", body), payload.get("code")
                 except ValueError:
-                    message = body[:200]
+                    message, code = body[:200], None
                 if exc.code == 429 and attempt < 3:
                     time.sleep(2 ** (attempt + 1))
                     continue
-                if exc.code == 422:  # e.g. NoSegment / InvalidInput: a valid "no match" answer
-                    return {"code": "InvalidInput", "message": message}
-                raise MapboxError(f"HTTP {exc.code}: {message}") from None
+                raise MapboxError(f"HTTP {exc.code}: {message}", exc.code, code, message) from None
             except urllib.error.URLError as exc:
                 raise MapboxError(f"network error: {exc.reason}") from None
-        raise MapboxError("rate limited")
+            except OSError as exc:  # timeouts while reading
+                raise MapboxError(f"network error: {type(exc).__name__}") from None
+        raise MapboxError("rate limited", 429)
 
 
 def limit_coordinates(coords: list[LonLat], net: RoadNetwork, limit: int = MAX_COORDINATES) -> list[LonLat]:
